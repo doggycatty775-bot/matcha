@@ -593,6 +593,90 @@ local matchacc = {
         JumpPower = 50,  -- Default Roblox jumppower
     },
 }
+-- Shared protection for the two aura features.
+function matchacc.KillAura:IsWhitelisted(player)
+    return player ~= nil and self.Whitelist[player.Name] == true
+end
+do
+    local service = game:GetService('Players')
+    local group = Tabs['UI Settings']:AddLeftGroupbox('Aura Whitelist')
+    local status = group:AddLabel('Whitelisted: None', true)
+    local updateWhitelistColors = function() end
+    local function validName(name)
+        return type(name) == 'string' and #name > 0 and #name <= 32 and name:match('^[%w_]+$')
+            and name ~= service.LocalPlayer.Name
+    end
+    local function namesFor(selected, leaving)
+        local names, seen = {}, {}
+        for _, player in ipairs(service:GetPlayers()) do
+            if player ~= service.LocalPlayer and player ~= leaving then seen[player.Name] = true end
+        end
+        for name, enabled in pairs(selected or {}) do
+            if enabled and validName(name) then seen[name] = true end
+        end
+        for name in pairs(seen) do table.insert(names, name) end
+        table.sort(names)
+        return names
+    end
+    group:AddDropdown('AuraWhitelist', {
+        Text = 'Whitelisted players', Values = namesFor({}), Multi = true,
+        AllowNull = true, Searchable = true,
+        Callback = function(selected)
+            local protected, names = {}, {}
+            for name, enabled in pairs(selected or {}) do
+                if enabled and validName(name) then
+                    protected[name] = true
+                    table.insert(names, name)
+                end
+            end
+            matchacc.KillAura.Whitelist = protected
+            table.sort(names)
+            status:SetText('Whitelisted: ' .. (#names > 0 and table.concat(names, ', ') or 'None'))
+            updateWhitelistColors()
+        end,
+    })
+    local dropdown = Options.AuraWhitelist
+    -- Use the theme accent for selected names, and restore normal text when deselected.
+    updateWhitelistColors = function()
+        if Lifecycle.Stopped then return end
+        for _, row in ipairs(dropdown.Menu.Menu:GetChildren()) do
+            if row:IsA('TextButton') then
+                local function textColor()
+                    return dropdown.Value[row.Text] and Library.Scheme.AccentColor or Library.Scheme.FontColor
+                end
+                Library.Registry[row] = Library.Registry[row] or {}
+                Library.Registry[row].TextColor3 = textColor
+                row.TextColor3 = textColor()
+            end
+        end
+    end
+    -- Searches and player-list refreshes rebuild the rows; style those new rows too.
+    Lifecycle:Connect(dropdown.Menu.Menu.ChildAdded, function(row)
+        if row:IsA('TextButton') then task.defer(updateWhitelistColors) end
+    end)
+    updateWhitelistColors()
+    local originalSetValue = dropdown.SetValue
+    -- Preserve saved usernames even if those players are not currently in this server.
+    function dropdown:SetValue(value)
+        local selected = {}
+        if type(value) == 'table' then
+            for name, enabled in pairs(value) do
+                if enabled and validName(name) then selected[name] = true end
+            end
+        end
+        self:SetValues(namesFor(selected))
+        originalSetValue(self, selected)
+    end
+    local function refresh(leaving)
+        dropdown:SetValues(namesFor(dropdown.Value, leaving))
+    end
+    Lifecycle:Connect(service.PlayerAdded, function() refresh() end)
+    Lifecycle:Connect(service.PlayerRemoving, function(player) refresh(player) end)
+    group:AddButton('Refresh Players', function() refresh() end)
+    group:AddButton('Clear Whitelist', function() dropdown:SetValue({}) end)
+    group:AddLabel('Click the box to see players. Select multiple names: accent color means whitelisted. Click a name again to restore its normal color and remove protection. Save your config to keep the list.', true)
+end
+
 local oldVelPos = {}
 --// Silent Aim Dot Circle
 local DotCircle = Drawing.new("Circle")
@@ -6862,7 +6946,7 @@ Lifecycle:Connect(RunService.Heartbeat, function(dt)
 			local closest = math.huge
 			local ka_target = nil
 			for _, player in pairs(players:GetPlayers()) do
-				if player ~= localPlayer and not matchacc.KillAura.Whitelist[player.Name] and player.Character and player.Character:FindFirstChild("Head") and not player.Character:FindFirstChild("GRABBING_CONSTRAINT") then
+				if player ~= localPlayer and not matchacc.KillAura:IsWhitelisted(player) and player.Character and player.Character:FindFirstChild("Head") and not player.Character:FindFirstChild("GRABBING_CONSTRAINT") then
 					if player.Character.BodyEffects:FindFirstChild("K.O") and not player.Character.BodyEffects["K.O"].Value then
 						local dist = (hrp.Position - player.Character.Head.Position).Magnitude
 						if dist < closest and dist <= matchacc.KillAura.Range then
@@ -6872,7 +6956,7 @@ Lifecycle:Connect(RunService.Heartbeat, function(dt)
 					end
 				end
 			end
-			if ka_target and ka_target.Character and ka_target.Character:FindFirstChild("Head") then
+			if ka_target and not matchacc.KillAura:IsWhitelisted(ka_target) and ka_target.Character and ka_target.Character:FindFirstChild("Head") then
 				hrp.CFrame = CFrame.lookAt(hrp.Position, ka_target.Character.Head.Position)
 				if matchacc.KillAura.Visualize then
 					ka_tracer.Transparency = 0
@@ -7031,7 +7115,7 @@ Lifecycle:Connect(RunService.Heartbeat, function(dt)
             local shortestDistance = math.huge
             local stompTarget
             for _, player in pairs(players:GetPlayers()) do
-                if player ~= localPlayer and player.Character and player.Character:FindFirstChild("Head") and KnockCheck(player) and not player.Character:FindFirstChild("ForceField") then
+                if player ~= localPlayer and not matchacc.KillAura:IsWhitelisted(player) and player.Character and player.Character:FindFirstChild("Head") and KnockCheck(player) and not player.Character:FindFirstChild("ForceField") then
                     local distance = (player.Character.HumanoidRootPart.Position - hrp.Position).Magnitude
                     if distance <= matchacc.KillAura.Range and distance < shortestDistance then
                         shortestDistance = distance
@@ -7039,7 +7123,7 @@ Lifecycle:Connect(RunService.Heartbeat, function(dt)
                     end
                 end
             end
-            if stompTarget then
+            if stompTarget and not matchacc.KillAura:IsWhitelisted(stompTarget) then
                 local bodyEffects = stompTarget.Character:FindFirstChild("BodyEffects")
                 local isDead = bodyEffects and bodyEffects:FindFirstChild("SDeath") and bodyEffects.SDeath.Value
                 if isDead == false then
@@ -13017,11 +13101,28 @@ MenuGroup:AddDropdown("DPIDropdown", {
 	end,
 })
 MenuGroup:AddDivider()
-MenuGroup:AddLabel("Open / Close UI (Delete)"):AddKeyPicker("MenuKeybind", { Default = "Delete", NoUI = true, Text = "Open / Close UI" })
+do
+    local keyboardKeys = {}
+    for _, key in ipairs(Enum.KeyCode:GetEnumItems()) do
+        -- Keyboard codes are below the gamepad range; Unknown cannot be bound.
+        if key.Value > 0 and key.Value < 1000 then table.insert(keyboardKeys, key.Name) end
+    end
+    table.sort(keyboardKeys)
+    MenuGroup:AddDropdown('MenuVisibilityKey', {
+        Text = 'Hide / Show GUI key', Values = keyboardKeys,
+        Default = 'Delete', Multi = false, AllowNull = false, Searchable = true,
+        Callback = function(name)
+            if name and Enum.KeyCode[name] then Library.ToggleKeybind = Enum.KeyCode[name] end
+        end,
+    })
+end
+MenuGroup:AddButton('Panic', function()
+    if not Library.Unloaded then Library:Unload() end
+end)
 MenuGroup:AddButton("Unload UI / Script", function()
     if not Library.Unloaded then Library:Unload() end
 end)
-MenuGroup:AddLabel('Delete hides/shows the menu. Unload stops this script.', true)
+MenuGroup:AddLabel('Choose any keyboard key above to hide/show the GUI while features keep running. Panic stops this script and removes its GUI. Save your config to keep the key.', true)
 getgenv().vu = game:GetService("VirtualUser")
 getgenv().isAntiAfkEnabled = false
 getgenv().antiAfkConnection = nil
@@ -13214,13 +13315,13 @@ WatermarkGroup:AddToggle('WatermarkShowPing', {
     end
 })
 
-Library.ToggleKeybind = Options.MenuKeybind
+Library.ToggleKeybind = Enum.KeyCode[Options.MenuVisibilityKey.Value or 'Delete']
 
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 
 -- Include theme values in named configs.
--- Keep Delete as the menu key even when loading older configs.
+-- Save the GUI visibility key with configs; ignore the legacy MenuKeybind option.
 
 ThemeManager:SetFolder('matchacc')
 SaveManager:SetFolder('matchacc/dahood')
