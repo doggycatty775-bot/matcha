@@ -706,7 +706,7 @@ end
 -- Stomp Aura notifications. The private URL is entered in Settings, not published in source.
 do
     local enabled, webhookUrl = false, ''
-    local pending = setmetatable({}, {__mode = 'k'})
+    local avatarCache = {}
     local reported = setmetatable({}, {__mode = 'k'})
     local queue, sending = {}, false
     local httpService = game:GetService('HttpService')
@@ -714,27 +714,31 @@ do
     local function validUrl(url)
         return type(url) == 'string' and url:match('^https://discord%.com/api/webhooks/%d+/[%w_%-]+$') ~= nil
     end
-    local function closeWatch(character)
-        local watch = pending[character]
-        if not watch then return end
-        pending[character] = nil
-        if watch.Connection then
-            watch.Connection:Disconnect()
-            Lifecycle.Connections[watch.Connection] = nil
-        end
-    end
     local function resetPending()
-        local characters = {}
-        for character in pairs(pending) do table.insert(characters, character) end
-        for _, character in ipairs(characters) do closeWatch(character) end
         queue = {}
     end
-    local function enqueue(targetName, userId, url)
+    local function getAvatar(userId, sendRequest)
+        if avatarCache[userId] then return avatarCache[userId] end
+        local ok, response = pcall(sendRequest, {
+            Url = 'https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=' .. tostring(userId)
+                .. '&size=150x150&format=Png&isCircular=false',
+            Method = 'GET',
+        })
+        if not ok or type(response) ~= 'table' or tonumber(response.StatusCode or response.Status) ~= 200 then return nil end
+        local decodedOk, data = pcall(httpService.JSONDecode, httpService, response.Body or '')
+        local entry = decodedOk and type(data) == 'table' and type(data.data) == 'table' and data.data[1]
+        if type(entry) == 'table' and entry.state == 'Completed' and tonumber(entry.targetId) == userId
+            and type(entry.imageUrl) == 'string' and entry.imageUrl:match('^https://[%w%-%.]+%.rbxcdn%.com/') then
+            avatarCache[userId] = entry.imageUrl
+            return entry.imageUrl
+        end
+    end
+    local function enqueue(targetName, displayName, userId, url)
         if #queue >= 50 then
             Library:Notify('Stomp notifications queue is full.', 5)
             return
         end
-        table.insert(queue, {Name = targetName, UserId = userId, Url = url})
+        table.insert(queue, {Name = targetName, DisplayName = displayName, UserId = userId, Url = url, Time = os.date('!%Y-%m-%dT%H:%M:%SZ')})
         if sending then return end
         sending = true
         task.spawn(function()
@@ -747,11 +751,21 @@ do
                     break
                 end
                 if item.Url == webhookUrl then
-                    local payload = httpService:JSONEncode({
-                        content = 'Stomp Aura: @' .. item.Name .. ' (User ID: ' .. tostring(item.UserId)
-                            .. ') was marked dead after a stomp attempt.',
-                        allowed_mentions = {parse = {}},
-                    })
+                    local embed = {
+                        title = 'Stomp Aura', color = 0x52C878,
+                        description = 'Stomp Aura issued a stomp attempt against this target.',
+                        url = 'https://www.roblox.com/users/' .. tostring(item.UserId) .. '/profile',
+                        fields = {
+                            {name = 'Username', value = '@' .. item.Name, inline = true},
+                            {name = 'Display name', value = item.DisplayName, inline = true},
+                            {name = 'User ID', value = tostring(item.UserId), inline = false},
+                        },
+                        timestamp = item.Time,
+                        footer = {text = 'Source: Stomp Aura | Attempt logged; server success not confirmed'},
+                    }
+                    local avatar = getAvatar(item.UserId, sendRequest)
+                    if avatar then embed.thumbnail = {url = avatar} end
+                    local payload = httpService:JSONEncode({embeds = {embed}, allowed_mentions = {parse = {}}})
                     for attempt = 1, 3 do
                         if Lifecycle.Stopped or not enabled or item.Url ~= webhookUrl then break end
                         local ok, response = pcall(sendRequest, {
@@ -782,32 +796,25 @@ do
             sending = false
         end)
     end
-    function Lifecycle:WatchStomp(target)
-        if self.Stopped or not enabled or not validUrl(webhookUrl) or not target
+    -- Only the Stomp Aura branch calls this. No death listener attributes other
+    -- players' stomps to this script. Commit the event only after FireServer returns.
+    function Lifecycle:PrepareStompNotification(target)
+        if self.Stopped or not enabled or not matchacc.KillAura.StompAura or not validUrl(webhookUrl) or not target
             or matchacc.KillAura:IsWhitelisted(target) then return nil end
         local character = target.Character
-        if not character or pending[character] or reported[character] then return nil end
+        if not character or reported[character] then return nil end
         local body = character:FindFirstChild('BodyEffects')
         local death = body and body:FindFirstChild('SDeath')
         if not death or death.Value ~= false then return nil end
-        local watch = {Armed = false, Url = webhookUrl}
-        pending[character] = watch
-        local function check()
-            if pending[character] ~= watch or not watch.Armed then return end
-            if self.Stopped or not enabled or webhookUrl ~= watch.Url or target.Character ~= character
-                or matchacc.KillAura:IsWhitelisted(target) then closeWatch(character); return end
-            if death.Value == true then
-                reported[character] = true
-                closeWatch(character)
-                enqueue(target.Name, target.UserId, watch.Url)
-            end
-        end
-        watch.Connection = self:Connect(death:GetPropertyChangedSignal('Value'), check)
-        task.delay(4, function()
-            if pending[character] == watch then closeWatch(character) end
-        end)
+        local url, name, displayName, userId = webhookUrl, target.Name, target.DisplayName or target.Name, target.UserId
+        local committed = false
         return function()
-            if pending[character] == watch then watch.Armed = true; check() end
+            if committed or self.Stopped or not enabled or not matchacc.KillAura.StompAura
+                or webhookUrl ~= url or target.Character ~= character or reported[character]
+                or matchacc.KillAura:IsWhitelisted(target) then return end
+            committed = true
+            reported[character] = true
+            enqueue(name, displayName, userId, url)
         end
     end
     group:AddInput('StompWebhookUrl', {
@@ -828,7 +835,7 @@ do
             if enabled and webhookUrl == '' then Library:Notify('Paste your Discord webhook URL to start notifications.', 5) end
         end,
     })
-    group:AddLabel('Reports a target death observed within 4 seconds of a Stomp Aura attempt. Another player may have caused the death. Save your config to remember these settings; configs containing the webhook URL are private.', true)
+    group:AddLabel('Sends an avatar embed only when this script issues a Stomp Aura attempt. Normal stomps and other players do not trigger it. One notice per target character; this is not server-confirmed success. Save your config to remember these settings; configs containing the webhook URL are private.', true)
     table.insert(Lifecycle.Cleanups, function() enabled = false; resetPending() end)
 end
 
@@ -7338,7 +7345,7 @@ Lifecycle:Connect(RunService.Heartbeat, function(dt)
                         hrp.CFrame = SavedPosition
                         RunService:UnbindFromRenderStep("RestoreStompAura")
                     end)
-                    local finishStompLog = Lifecycle:WatchStomp(stompTarget)
+                    local finishStompLog = Lifecycle:PrepareStompNotification(stompTarget)
                     MainEvent:FireServer("Stomp")
                     if finishStompLog then finishStompLog() end
                 end
