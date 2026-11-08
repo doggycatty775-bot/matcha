@@ -114,7 +114,11 @@ do
             pcall(function() if object:IsA('AnimationTrack') then object:Stop(0) end end)
             pcall(function() object:Destroy() end)
         end
-        for drawing in pairs(self.Drawings) do pcall(function() drawing:Remove() end) end
+        for drawing in pairs(self.Drawings) do
+            pcall(function() drawing.Visible = false end)
+            local ok = pcall(function() drawing:Remove() end)
+            if not ok then pcall(function() drawing:Destroy() end) end
+        end
         for object, properties in pairs(self.Originals) do
             for property, value in pairs(properties) do
                 pcall(function() object[property] = value[1] end)
@@ -316,10 +320,10 @@ local externalLoaderRunning = false
 LoaderGroup:AddButton({
     Text = "Spiderman",
     Func = function()
-        if externalLoaderRunning then return end
+        if Lifecycle.Stopped or externalLoaderRunning then return end
         externalLoaderRunning = true
         local success, err = pcall(function()
-            getgenv().script_key = "VFLwtZbKWgxKyahWRFadbtYcoXDdNAUX"
+            script_key = "VFLwtZbKWgxKyahWRFadbtYcoXDdNAUX";
             loadstring(game:HttpGet("https://api.luarmor.net/files/v4/loaders/3c353b14e101139eb4c535b30a2cae46.lua"))()
         end)
         externalLoaderRunning = false
@@ -335,7 +339,7 @@ local function addExtraLoaderButton(label, key, url)
     LoaderGroup:AddButton({
         Text = label,
         Func = function()
-            if running then return end
+            if Lifecycle.Stopped or running then return end
             running = true
             local success, err = pcall(function()
                 if key then getgenv().script_key = key end
@@ -593,6 +597,28 @@ local matchacc = {
         JumpPower = 50,  -- Default Roblox jumppower
     },
 }
+-- Turn owned feature state off as well as stopping its connections and loops.
+table.insert(Lifecycle.Cleanups, function()
+    local seen = {}
+    local function disableFlags(state)
+        if type(state) ~= 'table' or seen[state] then return end
+        seen[state] = true
+        for key, value in pairs(state) do
+            if type(value) == 'boolean' then state[key] = false
+            elseif type(value) == 'table' then disableFlags(value) end
+        end
+    end
+    disableFlags(matchacc)
+    disableFlags(getgenv().Matcha)
+    disableFlags(getgenv().matcha)
+    disableFlags(getgenv().ChinaHatSettings)
+    for _, key in ipairs({'RemoveShootAnimationsEnabled', 'trailEnabled', 'FlightEnabled',
+        'AutoHealEnabled', 'AutoArmorEnabled', 'AutoMaskEnabled', 'isAntiAfkEnabled',
+        'CASH_AURA_ENABLED', 'NoSeat', 'Desync'}) do
+        getgenv()[key] = false
+    end
+    for _, key in ipairs({'ScriptEnabled', 'rizzEnabled', 'toxicEnabled', 'PromoEnabled'}) do _G[key] = false end
+end)
 -- Shared protection for the two aura features.
 function matchacc.KillAura:IsWhitelisted(player)
     return player ~= nil and self.Whitelist[player.Name] == true
@@ -675,6 +701,135 @@ do
     group:AddButton('Refresh Players', function() refresh() end)
     group:AddButton('Clear Whitelist', function() dropdown:SetValue({}) end)
     group:AddLabel('Click the box to see players. Select multiple names: accent color means whitelisted. Click a name again to restore its normal color and remove protection. Save your config to keep the list.', true)
+end
+
+-- Stomp Aura notifications. The private URL is entered in Settings, not published in source.
+do
+    local enabled, webhookUrl = false, ''
+    local pending = setmetatable({}, {__mode = 'k'})
+    local reported = setmetatable({}, {__mode = 'k'})
+    local queue, sending = {}, false
+    local httpService = game:GetService('HttpService')
+    local group = Tabs['UI Settings']:AddRightGroupbox('Stomp Aura Notifications')
+    local function validUrl(url)
+        return type(url) == 'string' and url:match('^https://discord%.com/api/webhooks/%d+/[%w_%-]+$') ~= nil
+    end
+    local function closeWatch(character)
+        local watch = pending[character]
+        if not watch then return end
+        pending[character] = nil
+        if watch.Connection then
+            watch.Connection:Disconnect()
+            Lifecycle.Connections[watch.Connection] = nil
+        end
+    end
+    local function resetPending()
+        local characters = {}
+        for character in pairs(pending) do table.insert(characters, character) end
+        for _, character in ipairs(characters) do closeWatch(character) end
+        queue = {}
+    end
+    local function enqueue(targetName, userId, url)
+        if #queue >= 50 then
+            Library:Notify('Stomp notifications queue is full.', 5)
+            return
+        end
+        table.insert(queue, {Name = targetName, UserId = userId, Url = url})
+        if sending then return end
+        sending = true
+        task.spawn(function()
+            while #queue > 0 and enabled and not Lifecycle.Stopped do
+                local item = table.remove(queue, 1)
+                local sendRequest = http_request or request or (syn and syn.request) or (http and http.request)
+                if type(sendRequest) ~= 'function' then
+                    Library:Notify('Stomp notifications require HTTP request support.', 6)
+                    queue = {}
+                    break
+                end
+                if item.Url == webhookUrl then
+                    local payload = httpService:JSONEncode({
+                        content = 'Stomp Aura: @' .. item.Name .. ' (User ID: ' .. tostring(item.UserId)
+                            .. ') was marked dead after a stomp attempt.',
+                        allowed_mentions = {parse = {}},
+                    })
+                    for attempt = 1, 3 do
+                        if Lifecycle.Stopped or not enabled or item.Url ~= webhookUrl then break end
+                        local ok, response = pcall(sendRequest, {
+                            Url = item.Url .. '?wait=true', Method = 'POST',
+                            Headers = {['Content-Type'] = 'application/json'}, Body = payload,
+                        })
+                        if Lifecycle.Stopped then break end
+                        local code = ok and type(response) == 'table' and tonumber(response.StatusCode or response.Status) or nil
+                        if code and code >= 200 and code < 300 then break end
+                        if code == 429 and attempt < 3 then
+                            local decodedOk, body = pcall(httpService.JSONDecode, httpService, response.Body or '')
+                            local seconds = decodedOk and type(body) == 'table' and tonumber(body.retry_after) or 2
+                            if not seconds or seconds < 0 then seconds = 2 end
+                            if seconds > 60 then
+                                Library:Notify('Discord rate limit is too long; notification skipped.', 5)
+                                break
+                            end
+                            task.wait(seconds + 0.25)
+                        else
+                            -- Do not retry uncertain network failures: Discord may already have received the message.
+                            Library:Notify('Stomp notification failed' .. (code and ' (HTTP ' .. tostring(code) .. ')' or '') .. '.', 6)
+                            break
+                        end
+                    end
+                end
+                task.wait(1)
+            end
+            sending = false
+        end)
+    end
+    function Lifecycle:WatchStomp(target)
+        if self.Stopped or not enabled or not validUrl(webhookUrl) or not target
+            or matchacc.KillAura:IsWhitelisted(target) then return nil end
+        local character = target.Character
+        if not character or pending[character] or reported[character] then return nil end
+        local body = character:FindFirstChild('BodyEffects')
+        local death = body and body:FindFirstChild('SDeath')
+        if not death or death.Value ~= false then return nil end
+        local watch = {Armed = false, Url = webhookUrl}
+        pending[character] = watch
+        local function check()
+            if pending[character] ~= watch or not watch.Armed then return end
+            if self.Stopped or not enabled or webhookUrl ~= watch.Url or target.Character ~= character
+                or matchacc.KillAura:IsWhitelisted(target) then closeWatch(character); return end
+            if death.Value == true then
+                reported[character] = true
+                closeWatch(character)
+                enqueue(target.Name, target.UserId, watch.Url)
+            end
+        end
+        watch.Connection = self:Connect(death:GetPropertyChangedSignal('Value'), check)
+        task.delay(4, function()
+            if pending[character] == watch then closeWatch(character) end
+        end)
+        return function()
+            if pending[character] == watch then watch.Armed = true; check() end
+        end
+    end
+    group:AddInput('StompWebhookUrl', {
+        Text = 'Discord webhook URL', Default = '', Finished = true,
+        Placeholder = 'Paste your Discord webhook URL here',
+        Callback = function(value)
+            local url = tostring(value or ''):match('^%s*(.-)%s*$'):gsub('/$', '')
+            resetPending()
+            webhookUrl = validUrl(url) and url or ''
+            if url ~= '' and webhookUrl == '' then Library:Notify('Enter a valid Discord webhook URL.', 5) end
+        end,
+    })
+    group:AddToggle('StompWebhookEnabled', {
+        Text = 'Send Stomp Aura notifications', Default = false,
+        Callback = function(value)
+            enabled = value == true
+            if not enabled then resetPending() end
+            if enabled and webhookUrl == '' then Library:Notify('Paste your Discord webhook URL to start notifications.', 5) end
+        end,
+    })
+    group:AddLabel('Reports a target death observed within 4 seconds of a Stomp Aura attempt. Another player may have caused the death. Save your config to remember these settings; configs containing the webhook URL are private.', true)
+    table.insert(Lifecycle.Cleanups, function() enabled = false; resetPending() end)
 end
 
 local oldVelPos = {}
@@ -3968,8 +4123,59 @@ ChinaHatGroup:AddSlider('ChinaHatScaleZ', {
         end
     end
 })
-local MatchaEsp = loadstring(game:HttpGet('https://raw.githubusercontent.com/alebinh60/asmobile/refs/heads/main/esplib'))()
+-- Give ESP the same tracked constructors as the main script.
+local MatchaEsp = loadstring('return function(Drawing, Instance)\n' .. game:HttpGet('https://raw.githubusercontent.com/alebinh60/asmobile/refs/heads/main/esplib') .. '\nend')()(Drawing, Instance)
 local esp = MatchaEsp
+-- ESP's original Initialize stores some connections privately. Register all of
+-- its ongoing work with our lifecycle so Panic also stops ESP after respawns.
+do
+    local initialized = false
+    function esp:Initialize()
+        if initialized or Lifecycle.Stopped then return end
+        initialized = true
+        self.EspGui = Instance.new('ScreenGui')
+        self.EspGui.Name = 'MatchaEspGui'
+        self.EspGui.IgnoreGuiInset = true
+        self.EspGui.ResetOnSpawn = false
+        self.EspGui.Parent = game:GetService('Players').LocalPlayer.PlayerGui
+        local function clearPlayer(player)
+            for _, method in ipairs({'ClearBox', 'ClearSkeleton', 'ClearTracer', 'ClearChams', 'ClearRing'}) do
+                pcall(self[method], self, player)
+            end
+        end
+        local function watchCharacter(player, character)
+            Lifecycle:Connect(character.AncestryChanged, function()
+                if not character:IsDescendantOf(workspace) then clearPlayer(player) end
+            end)
+            local humanoid = character:FindFirstChildOfClass('Humanoid')
+            if humanoid then Lifecycle:Connect(humanoid.Died, function() clearPlayer(player) end) end
+        end
+        local function watchPlayer(player)
+            if player.Character then watchCharacter(player, player.Character) end
+            Lifecycle:Connect(player.CharacterAdded, function(character) watchCharacter(player, character) end)
+        end
+        local players = game:GetService('Players')
+        Lifecycle:Connect(players.PlayerRemoving, clearPlayer)
+        Lifecycle:Connect(players.PlayerAdded, watchPlayer)
+        for _, player in ipairs(players:GetPlayers()) do watchPlayer(player) end
+        local elapsed = 0
+        Lifecycle:Connect(game:GetService('RunService').Heartbeat, function(dt)
+            elapsed = elapsed + dt
+            if elapsed >= 30 then elapsed = 0; pcall(self.Cleanup, self) end
+        end)
+        Lifecycle:Connect(game:GetService('RunService').RenderStepped, function(dt)
+            for _, method in ipairs({'UpdateBox', 'UpdateSkeleton', 'UpdateTracer', 'UpdateChams', 'UpdateRing', 'UpdateAnimations'}) do
+                pcall(self[method], self, dt)
+            end
+        end)
+    end
+    table.insert(Lifecycle.Cleanups, function()
+        for key in pairs(esp.State) do esp.State[key] = false end
+        -- Even if a stale drawing makes Destroy fail, tracked constructors let
+        -- Lifecycle remove every remaining ESP drawing and Instance separately.
+        pcall(esp.Destroy, esp)
+    end)
+end
 local ESPGroup = Tabs.Visual:AddLeftGroupbox('ESP')
 
 -- Box ESP
@@ -7132,7 +7338,9 @@ Lifecycle:Connect(RunService.Heartbeat, function(dt)
                         hrp.CFrame = SavedPosition
                         RunService:UnbindFromRenderStep("RestoreStompAura")
                     end)
+                    local finishStompLog = Lifecycle:WatchStomp(stompTarget)
                     MainEvent:FireServer("Stomp")
+                    if finishStompLog then finishStompLog() end
                 end
             end
         end
@@ -9627,6 +9835,12 @@ local function include(module)
 end 
 -- Inclusions
 local DhLibrary = include("dh_library")
+do
+    local originalCreate = DhLibrary.Create
+    function DhLibrary:Create(...)
+        return Lifecycle:TrackObject(originalCreate(self, ...))
+    end
+end
 
 
 local Animations = DhLibrary:Animations()
